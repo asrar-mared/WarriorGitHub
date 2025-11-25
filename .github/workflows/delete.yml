@@ -1,0 +1,31 @@
+name: Remove Expired Workflow Runs
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  clean:
+    name: Delete Expired Workflow Runs
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Environment
+        run: |
+          chmod +x ./delete.sh
+        working-directory: .github/actions
+
+      - name: Execute Cleanup Script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sh ./delete.sh asrar-mared asrar-mared-hub
+        working-directory: .github/actions
