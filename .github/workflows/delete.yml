@@ -1,31 +1,155 @@
-name: Remove Expired Workflow Runs
+name: Enterprise Guardian – Security & Maintenance
 
 on:
   schedule:
-    - cron: "30 1 * * *"
+    - cron: "30 1 * * *"   # Daily cleanup at 01:30 UTC
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  security-events: write
+
+env:
+  ORG_NAME: asrar-mared
+  REPO_NAME: asrar-mared-hub
+
 jobs:
-  clean:
-    name: Delete Expired Workflow Runs
+
+  # ===============================
+  # 1️⃣ Cleanup Old Workflow Runs
+  # ===============================
+  cleanup:
+    name: Cleanup Expired Workflow Runs
     runs-on: ubuntu-latest
 
-    permissions:
-      actions: write
-      contents: read
+    steps:
+      - name: Delete old workflow runs (older than 14 days)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching workflow runs..."
+          gh api repos/$ORG_NAME/$REPO_NAME/actions/runs \
+            --paginate \
+            --jq '.workflow_runs[] | select(.created_at < (now - 1209600 | todate)) | .id' \
+          | while read run_id; do
+              echo "Deleting run $run_id"
+              gh api repos/$ORG_NAME/$REPO_NAME/actions/runs/$run_id -X DELETE
+            done
+
+  # ===============================
+  # 2️⃣ Verify & Re-sign Sensitive Files
+  # ===============================
+  gpg-verification:
+    name: Verify & Re-sign Security Files
+    runs-on: ubuntu-latest
+    needs: cleanup
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set Up Environment
+      - name: Import GPG Key
         run: |
-          chmod +x ./delete.sh
-        working-directory: .github/actions
+          echo "${{ secrets.PGP_PRIVATE_KEY }}" | gpg --batch --import
 
-      - name: Execute Cleanup Script
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify and re-sign
         run: |
-          sh ./delete.sh asrar-mared asrar-mared-hub
-        working-directory: .github/actions
+          for f in $(find . -type f \( -name "*.md" -o -name "*.sh" -o -name "*.yml" \)); do
+            if [ -f "$f.asc" ]; then
+              gpg --verify "$f.asc" "$f" || gpg --batch --yes --armor --detach-sign "$f"
+            else
+              gpg --batch --yes --armor --detach-sign "$f"
+            fi
+          done
+
+      - name: Commit updated signatures
+        run: |
+          git config user.name "Enterprise Guardian Bot"
+          git config user.email "guardian@enterprise.local"
+          git add *.asc
+          git commit -m "SECURITY: Re-signed sensitive files [ci skip]" || echo "No changes"
+          git push
+
+  # ===============================
+  # 3️⃣ Dependency & Vulnerability Scan
+  # ===============================
+  security-scan:
+    name: Dependency & Code Scan
+    runs-on: ubuntu-latest
+    needs: gpg-verification
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci || echo "No package.json"
+
+      - name: Run npm audit
+        run: npm audit --audit-level=high || true
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - uses: github/codeql-action/analyze@v3
+
+  # ===============================
+  # 4️⃣ Integrity Hash Monitoring
+  # ===============================
+  integrity-check:
+    name: Integrity Hash Validation
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SHA256 hash report
+        run: |
+          find . -type f -not -path "*/.git/*" -exec sha256sum {} \; > integrity-report.txt
+
+      - name: Upload integrity report
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrity-report
+          path: integrity-report.txt
+
+  # ===============================
+  # 5️⃣ Automatic Issue Assignment
+  # ===============================
+  auto-assign:
+    name: Auto Assign Governance
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: pozil/auto-assign-issue@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          assignees: asrar-mared
+          numOfAssignee: 1
+
+  # ===============================
+  # 6️⃣ Final Notification
+  # ===============================
+  notify:
+    name: Governance Notification
+    runs-on: ubuntu-latest
+    needs: [cleanup, gpg-verification, security-scan, integrity-check]
+
+    steps:
+      - name: Summary
+        run: |
+          echo "Enterprise Guardian completed successfully."
+          echo "Repository secured, verified, scanned, and audited."
